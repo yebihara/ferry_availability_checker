@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Ferry Availability Checker - フェリー空室確認システム'
+
+Globals:
+  Function:
+    Timeout: 900  # 15分
+    MemorySize: 2048
+
+Parameters:
+  DepartureDate:
+    Type: String
+    Default: '20250809'
+    Description: 'チェックする出発日（YYYYMMDD形式）'
+  
+  NotificationEmail:
+    Type: String
+    Default: 'yuichiro.ebihara@gmail.com'
+    Description: '通知先メールアドレス'
+
+Resources:
+  FerryAvailabilityChecker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ferry-availability-checker
+      PackageType: Image
+      ImageUri: 056321667033.dkr.ecr.us-east-1.amazonaws.com/ferry-availability-checker:latest
+      Environment:
+        Variables:
+          DEPARTURE_DATE: !Ref DepartureDate
+          NOTIFICATION_EMAIL: !Ref NotificationEmail
+      Events:
+        HourlyCheck:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)  # 1時間おきに実行
+            Input: !Sub |
+              {
+                "departure_date": "${DepartureDate}"
+              }
+      Policies:
+        - SESCrudPolicy:
+            IdentityName: "*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+
+Outputs:
+  FerryAvailabilityCheckerFunction:
+    Description: "Ferry Availability Checker Lambda Function ARN"
+    Value: !GetAtt FerryAvailabilityChecker.Arn

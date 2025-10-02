@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-フェリー空室確認プログラム
-大阪南港 → 東京間のフェリー予約サイトで空室状況を確認する
+AWS Lambda用フェリー空室確認プログラム
 """
 
-import time
-import sys
-import argparse
-import os
 import json
+import os
+import time
 import boto3
 from datetime import datetime
 from selenium import webdriver
@@ -21,19 +18,45 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 
 def setup_driver():
-    """Chrome WebDriverのセットアップ"""
+    """Chrome WebDriverのセットアップ（Lambda用）"""
     options = Options()
-    options.add_argument('--headless')  # ヘッドレスモードで実行
+    
+    # シンプルで確実な設定
+    options.add_argument('--headless')
     options.add_argument('--no-sandbox')
+    options.add_argument('--disable-gpu')
     options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
+    options.add_argument('--window-size=1280x1696')
+    
+    # Lambda環境用の設定
+    options.binary_location = '/opt/chrome/chrome'
+    
+    from selenium.webdriver.chrome.service import Service
+    service = Service(
+        executable_path='/usr/local/bin/chromedriver',
+        log_path='/tmp/chromedriver.log'
+    )
     
     try:
-        driver = webdriver.Chrome(options=options)
+        print("ChromeDriverサービスを開始中...")
+        driver = webdriver.Chrome(
+            service=service,
+            options=options
+        )
+        
+        print("WebDriverが正常に初期化されました")
+        print(f"Chrome version: {driver.capabilities['browserVersion']}")
+        print(f"ChromeDriver version: {driver.capabilities['chrome']['chromedriverVersion']}")
+        
+        # タイムアウトを短めに設定
+        driver.set_page_load_timeout(30)
+        driver.implicitly_wait(10)
+        
         return driver
     except Exception as e:
-        print(f"WebDriverの初期化に失敗しました: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"WebDriver初期化エラー: {e}")
+        print(f"エラー型: {type(e).__name__}")
+        raise
 
 
 def send_notification_email(availability_status, departure_date, has_availability=False):
@@ -117,41 +140,26 @@ def send_notification_email(availability_status, departure_date, has_availabilit
         return False
 
 
-def setup_driver_lambda():
-    """Lambda用Chrome WebDriverのセットアップ"""
-    from tempfile import mkdtemp
-    
-    options = webdriver.ChromeOptions()
-    service = webdriver.ChromeService("/opt/chromedriver")
-
-    options.binary_location = '/opt/chrome/chrome'
-    options.add_argument("--headless=new")
-    options.add_argument('--no-sandbox')
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,1696")
-    options.add_argument("--single-process")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-dev-tools")
-    options.add_argument("--no-zygote")
-    options.add_argument(f"--user-data-dir={mkdtemp()}")
-    options.add_argument(f"--data-path={mkdtemp()}")
-    options.add_argument(f"--disk-cache-dir={mkdtemp()}")
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
-
-    return webdriver.Chrome(options=options, service=service)
-
-
-def check_ferry_availability(departure_date, use_lambda=False):
-    """フェリーの空室状況をチェック"""
-    driver = setup_driver_lambda() if use_lambda else setup_driver()
-    
+def parse_date(date_str):
+    """YYYYMMDD形式の日付文字列をYYYY/MM/DD形式に変換"""
     try:
-        # 初期ページにアクセス
-        driver.get("https://yoyaku-otf.jp/ryokyaku")
+        date_obj = datetime.strptime(date_str, "%Y%m%d")
+        return date_obj.strftime("%Y/%m/%d")
+    except ValueError:
+        raise ValueError(f"日付形式が正しくありません: {date_str}")
+
+
+def check_ferry_availability(departure_date):
+    """フェリーの空室状況をチェック"""
+    driver = None
+    try:
+        driver = setup_driver()
         
         # ページの読み込み待機
-        wait = WebDriverWait(driver, 10)
+        wait = WebDriverWait(driver, 15)
+        
+        # 初期ページにアクセス
+        driver.get("https://yoyaku-otf.jp/ryokyaku")
         
         # 利用規約に同意
         try:
@@ -159,8 +167,8 @@ def check_ferry_availability(departure_date, use_lambda=False):
             driver.execute_script("arguments[0].click();", agree_checkbox)
             time.sleep(1)
         except Exception as e:
-            print(f"同意チェックボックスでエラー: {e}", file=sys.stderr)
-            print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"同意チェックボックスでエラー: {e}")
+            print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         
         # 「新規予約へ進む」ボタンをクリック
         try:
@@ -168,50 +176,46 @@ def check_ferry_availability(departure_date, use_lambda=False):
             driver.execute_script("arguments[0].click();", new_reservation_button)
             time.sleep(3)
         except Exception as e:
-            print(f"新規予約ボタンでエラー: {e}", file=sys.stderr)
-            print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"新規予約ボタンでエラー: {e}")
+            print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         
         # 往復選択で「片道」を選択（値が2）
         try:
-            # 片道は値が2のラジオボタン
             one_way_element = driver.find_element(By.ID, "w_ryokyaku_yoyaku_ohuku_yoyaku_kb_2")
             driver.execute_script("arguments[0].click();", one_way_element)
             time.sleep(1)
         except Exception as e:
-            print(f"片道選択でエラー: {e}", file=sys.stderr)
-            print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"片道選択でエラー: {e}")
+            print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         
         # 航路選択で「東京 >>> 徳島」を選択
         try:
-            # 東京 <=> 徳島の航路（値が12）を選択
             route_element = driver.find_element(By.ID, "w_ryokyaku_yoyaku_koro_cd")
             select = Select(route_element)
             select.select_by_value("12")
             time.sleep(1)
         except Exception as e:
-            print(f"航路選択でエラー: {e}", file=sys.stderr)
-            print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"航路選択でエラー: {e}")
+            print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         
         # 出発日を設定
         try:
-            # 実際の日付入力フィールドIDに基づいて設定
             date_element = driver.find_element(By.ID, "w_ryokyaku_yoyaku_yuki_jyosen_on")
             date_element.clear()
             date_element.send_keys(departure_date)
             time.sleep(1)
         except Exception as e:
-            print(f"日付入力でエラー: {e}", file=sys.stderr)
-            print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"日付入力でエラー: {e}")
+            print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         
         # 「次へ進む」ボタンをクリック
         try:
-            # 実際の送信ボタンに基づいてクリック
             next_button = driver.find_element(By.CSS_SELECTOR, "input[value='次へ進む']")
             driver.execute_script("arguments[0].click();", next_button)
-            time.sleep(5)  # ページ遷移を十分に待つ
+            time.sleep(5)
         except Exception as e:
-            print(f"次へボタンクリックでエラー: {e}", file=sys.stderr)
-            print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"次へボタンクリックでエラー: {e}")
+            print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         
         # 空室状況をチェック
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -222,16 +226,11 @@ def check_ferry_availability(departure_date, use_lambda=False):
             "二等洋室": "取得できませんでした"
         }
         
-        # spare_ct クラスを持つセルを探す
-        spare_cells = driver.find_elements(By.CLASS_NAME, "spare_ct")
-        
-        # 各部屋タイプの行を探す
         tables = driver.find_elements(By.TAG_NAME, "table")
         
         for table in tables:
             table_text = table.text
             if '二等洋室' in table_text or '2名個室' in table_text:
-                # このテーブル内で空き状況を検索
                 rows = table.find_elements(By.TAG_NAME, "tr")
                 for row in rows:
                     try:
@@ -251,89 +250,41 @@ def check_ferry_availability(departure_date, use_lambda=False):
                             if availability_text:
                                 room_availability["二等洋室"] = availability_text
                     except Exception as e:
-                        # 個別の行でエラーが起きても続行
-                        print(f"行の処理でエラー: {e}", file=sys.stderr)
+                        print(f"行の処理でエラー: {e}")
                         continue
         
-        # 結果を出力（非Lambda環境の場合のみ）
-        if not use_lambda:
-            print(f"2名個室: {room_availability['2名個室']}")
-            print(f"二等洋室: {room_availability['二等洋室']}")
-        
         return room_availability
-                    
+        
     except TimeoutException as e:
-        print("ページの読み込みがタイムアウトしました", file=sys.stderr)
-        print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+        print("ページの読み込みがタイムアウトしました")
+        print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         return {
             "2名個室": "取得できませんでした",
             "二等洋室": "取得できませんでした"
         }
     except Exception as e:
-        print(f"予期しないエラーが発生しました: {e}", file=sys.stderr)
-        print(f"エラーの詳細: {type(e).__name__}: {str(e)}", file=sys.stderr)
+        print(f"予期しないエラーが発生しました: {e}")
+        print(f"エラーの詳細: {type(e).__name__}: {str(e)}")
         return {
             "2名個室": "取得できませんでした",
             "二等洋室": "取得できませんでした"
         }
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
 
-def parse_date(date_str):
-    """YYYYMMDD形式の日付文字列をYYYY/MM/DD形式に変換"""
+def lambda_handler(event, context):
+    """Lambda関数のエントリーポイント"""
     try:
-        # YYYYMMDD形式の文字列をパース
-        date_obj = datetime.strptime(date_str, "%Y%m%d")
-        # YYYY/MM/DD形式に変換
-        return date_obj.strftime("%Y/%m/%d")
-    except ValueError:
-        print(f"エラー: 日付形式が正しくありません。YYYYMMDD形式で入力してください: {date_str}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="フェリー空室確認プログラム",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-使用例:
-  python ferry_availability_checker.py 20250809
-  python ferry_availability_checker.py 20251225
-        """
-    )
-    parser.add_argument(
-        "date",
-        help="出発日をYYYYMMDD形式で指定（例: 20250809）"
-    )
-    
-    args = parser.parse_args()
-    
-    # 日付を変換
-    formatted_date = parse_date(args.date)
-    
-    # 空室確認を実行
-    check_ferry_availability(formatted_date)
-
-
-def handler(event=None, context=None):
-    """Lambda handler function"""
-    try:
-        # 環境変数DEPARTURE_DATEから日付を取得
-        departure_date = os.environ.get('DEPARTURE_DATE')
+        # 環境変数から日付を取得（デフォルトは20250809）
+        departure_date_raw = os.environ.get('DEPARTURE_DATE', '20250809')
+        departure_date = parse_date(departure_date_raw)
         
-        if departure_date:
-            # 環境変数から取得した日付を使用
-            formatted_date = parse_date(departure_date)
-        else:
-            # 環境変数がない場合はデフォルトで今日の日付を使用
-            today = datetime.now()
-            formatted_date = today.strftime("%Y/%m/%d")
+        print(f"フェリー空室チェック開始: {departure_date}")
         
-        print(f"フェリー空室チェック開始: {formatted_date}")
-        
-        # Lambda環境でフェリー空室確認を実行
-        availability = check_ferry_availability(formatted_date, use_lambda=True)
+        # 空室状況をチェック
+        availability = check_ferry_availability(departure_date)
         
         print(f"空室状況: {availability}")
         
@@ -345,7 +296,7 @@ def handler(event=None, context=None):
                 break
         
         result = {
-            'departure_date': formatted_date,
+            'departure_date': departure_date,
             'availability': availability,
             'has_availability': has_availability,
             'notification_sent': False
@@ -357,7 +308,7 @@ def handler(event=None, context=None):
         else:
             print("空きがありませんでした。定期通知メールを送信します。")
         
-        notification_success = send_notification_email(availability, formatted_date, has_availability)
+        notification_success = send_notification_email(availability, departure_date, has_availability)
         result['notification_sent'] = notification_success
         
         return {

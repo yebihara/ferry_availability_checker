@@ -4,6 +4,14 @@ provider:
   name: aws
   stage: ${opt:stage, 'prod'}
   region: ${env:AWS_REGION, 'us-east-1'}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource: "*"
   ecr:
     images:
       img:
